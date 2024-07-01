@@ -1,17 +1,20 @@
 import openai
+from openai import OpenAI
+
 import socket
 import ssl
 import time
 import configparser
 import pyshorteners
 from typing import Union, Tuple
+from message import Messages
 
 # Read configuration from file
 config = configparser.ConfigParser()
 config.read('chat.conf')
+client = OpenAI(api_key=config.get('openai', 'api_key'))
 
 # Set up OpenAI API key
-openai.api_key = config.get('openai', 'api_key')
 
 # Set up ChatCompletion parameters
 model = config.get('chatcompletion', 'model')
@@ -38,6 +41,7 @@ password = config.get('irc', 'password')
 completion_models = ["gpt-3.5-turbo-instruct", "babbage-002", "davinci-002"]
 chatcompletion_models = ["gpt-4o", "gpt-4", "gpt-4-turbo", "gpt-4-turbo-preview", "gpt-3.5-turbo"]
 images_models = ["dall-e-2", "dall-e-3"]
+messages = []
 
 # Connect to IRC server
 def connect(server, port, usessl, password, ident, realname, nickname, channels):
@@ -63,6 +67,8 @@ def connect(server, port, usessl, password, ident, realname, nickname, channels)
 
 irc = connect(server, port, usessl, password, ident, realname, nickname, channels)
 
+msgs = Messages(minutes=1)
+# This assumes only 1 channel
 # Listen for messages from users and answer questions
 while True:
     try:
@@ -97,21 +103,26 @@ while True:
             if data.split(" :")[1].strip() in channels:
                 irc.send(bytes("JOIN " + data.split(" :")[1].strip() + "\n", "UTF-8"))
                 print("Invited into channel " + data.split(" :")[1].strip() + ". Joining...")
-        elif command == "PRIVMSG" and chunk[2].startswith("#") and chunk[3] == ":" + nickname + ":":
+        # changed to not require nick
+        #elif command == "PRIVMSG" and chunk[2].startswith("#") and chunk[3] == ":" + nickname + ":":
+        elif command == "PRIVMSG" and chunk[2].startswith("#"):
             channel = chunk[2].strip()
-            question = data.split(nickname + ":")[1].strip()
+            question = data.split(":")[2].strip()
+            print("question:", question)
+            msgs.add_message(chunk[0].split('!')[0] + ": " + question)
+            full_context = msgs.full_context_from_messages()
+            print(full_context)
             if model in chatcompletion_models:
                 try:
-                    response = openai.ChatCompletion.create(
-                        model=model,
-                        messages=[{"role": "system", "content": context}, {"role": "user", "content": question}],
-                        temperature=temperature,
-                        max_tokens=max_tokens,
-                        top_p=top_p,
-                        frequency_penalty=frequency_penalty,
-                        presence_penalty=presence_penalty,
-                        request_timeout=request_timeout
-                    )
+                    response = client.chat.completions.create(model=model,
+                    messages=[{"role": "system", "content": context}, {"role": "user", "content": full_context}],
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                    top_p=top_p,
+                    frequency_penalty=frequency_penalty,
+                    #request_timeout=request_timeout, # depricated in new api apparently
+                    presence_penalty=presence_penalty)
+                    msgs.add_message("agent: " + response.choices[0].message.content.strip())
                     answers = [x.strip() for x in response.choices[0].message.content.strip().split('\n')]
                     for answer in answers:
                         while len(answer) > 0:
@@ -124,10 +135,10 @@ while True:
                                     last_space_index = 392
                                 irc.send(bytes("PRIVMSG " + channel + " :" + answer[:last_space_index] + "\n", "UTF-8"))
                                 answer = answer[last_space_index:].lstrip()
-                except openai.error.Timeout as e:
+                except openai.Timeout as e:
                     print("Error: " + str(e))
                     irc.send(bytes("PRIVMSG " + channel + " :API call timed out. Try again later.\n", "UTF-8"))
-                except openai.error.OpenAIError as e:
+                except openai.OpenAIError as e:
                     print("Error: " + str(e))
                     irc.send(bytes(f"PRIVMSG {channel} :API call failed. {str(e)}\n", "UTF-8"))
                 except Exception as e:
@@ -135,16 +146,14 @@ while True:
                     irc.send(bytes(f"PRIVMSG {channel} :An unexpected error occurred. {str(e)}\n", "UTF-8"))
             elif model in completion_models:
                 try:
-                    response = openai.Completion.create(
-                        model=model,
-                        prompt="Q: " + question + "\nA:",
-                        temperature=temperature,
-                        max_tokens=max_tokens,
-                        top_p=top_p,
-                        frequency_penalty=frequency_penalty,
-                        presence_penalty=presence_penalty,
-                        request_timeout=request_timeout
-                    )
+                    response = client.completions.create(model=model,
+                    prompt="Q: " + question + "\nA:",
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                    top_p=top_p,
+                    frequency_penalty=frequency_penalty,
+                    presence_penalty=presence_penalty,)
+                    #request_timeout=request_timeout)
                     answers = [x.strip() for x in response.choices[0].text.strip().split('\n')]
                     for answer in answers:
                         while len(answer) > 0:
@@ -157,10 +166,10 @@ while True:
                                     last_space_index = 392
                                 irc.send(bytes("PRIVMSG " + channel + " :" + answer[:last_space_index] + "\n", "UTF-8"))
                                 answer = answer[last_space_index:].lstrip()
-                except openai.error.Timeout as e:
+                except openai.Timeout as e:
                     print("Error: " + str(e))
                     irc.send(bytes("PRIVMSG " + channel + " :API call timed out. Try again later.\n", "UTF-8"))
-                except openai.error.OpenAIError as e:
+                except openai.OpenAIError as e:
                     print("Error: " + str(e))
                     irc.send(bytes(f"PRIVMSG {channel} :API call failed. {str(e)}\n", "UTF-8"))
                 except Exception as e:
@@ -168,19 +177,17 @@ while True:
                     irc.send(bytes(f"PRIVMSG {channel} :An unexpected error occurred. {str(e)}\n", "UTF-8"))
             elif model in images_models:
                 try:
-                    response = openai.Image.create(
-                    prompt="Q: " + question + "\nA:",
+                    response = client.images.generate(prompt="Q: " + question + "\nA:",
                     n=1,
-                    size="1024x1024"
-                    )
+                    size="1024x1024")
                     long_url = response.data[0].url
                     type_tiny = pyshorteners.Shortener()
                     short_url = type_tiny.tinyurl.short(long_url)
                     irc.send(bytes("PRIVMSG " + channel + " :" + short_url + "\n", "UTF-8"))
-                except openai.error.Timeout as e:
+                except openai.Timeout as e:
                     print("Error: " + str(e))
                     irc.send(bytes("PRIVMSG " + channel + " :API call timed out. Try again later.\n", "UTF-8"))
-                except openai.error.OpenAIError as e:
+                except openai.OpenAIError as e:
                     print("Error: " + str(e))
                     irc.send(bytes(f"PRIVMSG {channel} :API call failed. {str(e)}\n", "UTF-8"))
                 except Exception as e:
